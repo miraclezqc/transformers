@@ -262,6 +262,8 @@ class Dots3NoteOmniConfig(PreTrainedConfig):
         Whether to normalize the rotary portion of compressed keys independently.
     apply_mla_qkv_lora_rescale (`bool`, *optional*, defaults to `True`):
         Whether to apply the checkpoint-compatible scale to low-rank MLA query, key, and value projections.
+    qk_layernorm (`bool`, *optional*, defaults to `True`):
+        Whether to normalize the low-rank query and key/value representations before their up-projections.
     attention_gate_type (`str`, *optional*, defaults to `"headwise"`):
         Granularity of output gates in full-attention layers.
     softmax_type (`str`, *optional*, defaults to `"vanilla"`):

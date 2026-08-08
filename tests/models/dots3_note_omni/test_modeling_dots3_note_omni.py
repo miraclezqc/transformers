@@ -53,6 +53,7 @@ if is_torch_available():
 
     from transformers.models.dots3_note_omni.modeling_dots3_note_omni import (
         Dots3NoteOmniAudioModel,
+        Dots3NoteOmniTextAttention,
         Dots3NoteOmniTextForCausalLM,
         Dots3NoteOmniTextIndexer,
         Dots3NoteOmniTextModel,
@@ -278,6 +279,166 @@ class Dots3NoteOmniModelTest(unittest.TestCase):
 
         self.assertEqual(full_logits.shape, (1, 5, config.vocab_size))
         torch.testing.assert_close(cached_logits[:, -1], full_logits[:, -1], rtol=1e-4, atol=1e-4)
+
+    @parameterized.expand([(True,), (False,)])
+    def test_qk_layernorm_config(self, qk_layernorm):
+        config = get_tiny_config()
+        config.qk_layernorm = qk_layernorm
+
+        for is_sliding in (False, True):
+            attention = Dots3NoteOmniTextAttention(config, layer_idx=int(is_sliding), is_sliding=is_sliding)
+            self.assertEqual(isinstance(attention.q_a_layernorm, torch.nn.Identity), not qk_layernorm)
+            self.assertEqual(isinstance(attention.kv_a_layernorm, torch.nn.Identity), not qk_layernorm)
+            self.assertNotIsInstance(attention.k_rope_only_layernorm, torch.nn.Identity)
+
+    def test_omni_text_only_forward_cache_and_generate(self):
+        config = get_tiny_config()
+        model = Dots3NoteOmniForCausalLM(config).eval()
+        input_ids = torch.tensor([[1, 7, 11, 9, 6]])
+        attention_mask = torch.ones_like(input_ids)
+
+        with (
+            patch.object(
+                model.vision_encoder,
+                "forward",
+                side_effect=AssertionError("text-only forward must not call the vision encoder"),
+            ),
+            patch.object(
+                model.audio_encoder,
+                "forward",
+                side_effect=AssertionError("text-only forward must not call the audio encoder"),
+            ),
+            torch.no_grad(),
+        ):
+            full = model(input_ids, attention_mask=attention_mask, use_cache=False)
+            prefix = model(input_ids[:, :-1], attention_mask=attention_mask[:, :-1], use_cache=True)
+            cached = model(
+                input_ids[:, -1:],
+                attention_mask=attention_mask,
+                past_key_values=prefix.past_key_values,
+                use_cache=True,
+            )
+            generated = model.generate(
+                input_ids[:, :-1],
+                attention_mask=attention_mask[:, :-1],
+                do_sample=False,
+                min_new_tokens=2,
+                max_new_tokens=2,
+                use_cache=True,
+            )
+
+        self.assertIsInstance(prefix.past_key_values, DynamicCache)
+        torch.testing.assert_close(cached.logits[:, -1], full.logits[:, -1], rtol=1e-4, atol=1e-4)
+        self.assertEqual(generated.shape, (1, input_ids.shape[1] + 1))
+
+    @parameterized.expand([(511,), (512,), (513,)])
+    def test_swa_release_window_boundary(self, sequence_length):
+        config = get_tiny_config()
+        config.sliding_window_size = 512
+        config.sliding_window = 512
+        cache = DynamicCache(config=config)
+        layer_idx = 1
+        layer = cache.layers[layer_idx]
+
+        past_length = sequence_length - 1
+        past = torch.arange(past_length, dtype=torch.float32).view(1, 1, past_length, 1)
+        cache.update(past, past, layer_idx)
+        kv_length, kv_offset = layer.get_mask_sizes(query_length=1)
+        current = torch.tensor([sequence_length - 1], dtype=torch.float32).view(1, 1, 1, 1)
+        returned_keys, _ = cache.update(current, current, layer_idx)
+
+        expected_attention_keys = torch.arange(max(0, sequence_length - 512), sequence_length, dtype=torch.float32)
+        expected_stored_keys = torch.arange(max(0, sequence_length - 511), sequence_length, dtype=torch.float32)
+        torch.testing.assert_close(returned_keys.flatten(), expected_attention_keys)
+        torch.testing.assert_close(layer.keys.flatten(), expected_stored_keys)
+        self.assertEqual(layer.cumulative_length, sequence_length)
+        self.assertEqual(kv_length, min(sequence_length, 512))
+        self.assertEqual(kv_offset, max(sequence_length - 512, 0))
+
+    @parameterized.expand([(2047, 2047), (2048, 2048), (2049, 2048)])
+    def test_dsa_release_topk_boundary(self, key_length, expected_topk):
+        config = get_tiny_config(use_dsa=True)
+        config.index_topk = 2048
+        indexer = Dots3NoteOmniTextIndexer(config, layer_idx=0).eval()
+        for parameter in indexer.parameters():
+            torch.nn.init.zeros_(parameter)
+
+        class FakeIndexerCache:
+            def update_indexer(self, new_keys, layer_idx):
+                past_keys = new_keys.new_zeros((1, key_length - 1, new_keys.shape[-1]))
+                return torch.cat((past_keys, new_keys), dim=1)
+
+        hidden_states = torch.zeros(1, 1, config.hidden_size)
+        q_lora = torch.zeros(1, 1, config.q_lora_rank)
+        cos = torch.ones(1, 1, config.qk_rope_head_dim // 2)
+        sin = torch.zeros_like(cos)
+        indices = indexer(
+            hidden_states,
+            q_lora,
+            cos,
+            sin,
+            padding_mask=torch.ones(1, key_length, dtype=torch.long),
+            cache_position=torch.tensor([key_length - 1]),
+            past_key_values=FakeIndexerCache(),
+        )
+
+        self.assertEqual(indices.shape, (1, 1, expected_topk))
+        self.assertEqual(indices.unique().numel(), expected_topk)
+        self.assertTrue(indices.ge(0).all())
+        self.assertTrue(indices.lt(key_length).all())
+        if key_length <= config.index_topk:
+            torch.testing.assert_close(indices[0, 0].sort().values, torch.arange(key_length, dtype=torch.int32))
+
+    @parameterized.expand([(4096, False), (4097, True)])
+    def test_dsa_sparse_backend_dispatch_boundary(self, key_length, expect_sparse):
+        config = get_tiny_config(use_dsa=True)
+        config.index_topk = 2048
+        attention = Dots3NoteOmniTextAttention(config, layer_idx=0, is_sliding=False).eval()
+        selected = torch.arange(key_length - config.index_topk, key_length, dtype=torch.int32).view(1, 1, -1)
+
+        class FakeCache:
+            def update(self, key, value, layer_idx, cache_kwargs):
+                key = key.new_zeros(key.shape[0], key.shape[1], key_length, key.shape[-1])
+                value = value.new_zeros(value.shape[0], value.shape[1], key_length, value.shape[-1])
+                return key, value
+
+        dense_masks = []
+
+        def fake_dense(module, query, key, value, attention_mask, **kwargs):
+            dense_masks.append(attention_mask)
+            return value.new_zeros(value.shape[0], query.shape[2], value.shape[1], value.shape[-1]), None
+
+        def fake_sparse(module, query, key, value, *args, **kwargs):
+            return value.new_zeros(value.shape[0], query.shape[2], value.shape[1], value.shape[-1]), None
+
+        hidden_states = torch.zeros(1, 1, config.hidden_size)
+        cos = torch.ones(1, 1, config.qk_rope_head_dim // 2)
+        sin = torch.zeros_like(cos)
+        with (
+            patch.object(attention.indexer, "forward", return_value=selected),
+            patch(
+                "transformers.models.dots3_note_omni.modeling_dots3_note_omni.eager_attention_forward",
+                side_effect=fake_dense,
+            ) as dense_mock,
+            patch(
+                "transformers.models.dots3_note_omni.modeling_dots3_note_omni.dsa_sparse_attention_forward",
+                side_effect=fake_sparse,
+            ) as sparse_mock,
+            torch.no_grad(),
+        ):
+            attention(
+                hidden_states,
+                cos,
+                sin,
+                position_ids=torch.tensor([[key_length - 1]]),
+                past_key_value=FakeCache(),
+                cache_position=torch.tensor([key_length - 1]),
+            )
+
+        self.assertEqual(sparse_mock.call_count, int(expect_sparse))
+        self.assertEqual(dense_mock.call_count, int(not expect_sparse))
+        if not expect_sparse:
+            self.assertEqual(int(dense_masks[0].sum()), config.index_topk)
 
     def test_dsa_text_forward(self):
         config = get_tiny_config(use_dsa=True)

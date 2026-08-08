@@ -16,6 +16,7 @@ import gc
 import tempfile
 import unittest
 from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from parameterized import parameterized
@@ -39,6 +40,8 @@ from transformers.utils import is_torch_available
 if is_torch_available():
     import torch
 
+    from transformers.integrations.finegrained_fp8 import Fp8Dequantize, Fp8Quantize
+
 
 @contextmanager
 def _patch_no_accelerator():
@@ -50,6 +53,78 @@ def _patch_no_accelerator():
                 patch("transformers.quantizers.quantizer_finegrained_fp8.is_torch_xpu_available", return_value=False)
             )
         yield
+
+
+@unittest.skipUnless(is_torch_available(), "requires PyTorch")
+class FineGrainedFP8ConversionTest(unittest.TestCase):
+    def setUp(self):
+        self.hf_quantizer = SimpleNamespace(
+            pre_quantized=True,
+            quantization_config=FineGrainedFP8Config(weight_block_size=(128, 128), dequantize=True),
+        )
+
+    def test_dequantize_partial_blocks(self):
+        weight = torch.ones((576, 256), dtype=torch.float8_e4m3fn)
+        scales = torch.arange(1, 11, dtype=torch.float32).reshape(5, 2)
+
+        actual = Fp8Dequantize(self.hf_quantizer)._dequantize_one(
+            weight,
+            scales,
+            output_dtype=torch.bfloat16,
+        )
+
+        expanded_scales = scales.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+        expected = expanded_scales[:576, :256].to(torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_quantize_partial_blocks(self):
+        weight = torch.linspace(-1, 1, 576 * 256, dtype=torch.float32).reshape(576, 256)
+
+        converted = Fp8Quantize(self.hf_quantizer)._quantize_one("proj.weight", weight)
+
+        self.assertEqual(converted["proj.weight"].shape, weight.shape)
+        self.assertEqual(converted["proj.weight_scale_inv"].shape, (5, 2))
+        restored = Fp8Dequantize(self.hf_quantizer)._dequantize_one(
+            converted["proj.weight"],
+            converted["proj.weight_scale_inv"],
+            output_dtype=torch.float32,
+        )
+        self.assertEqual(restored.shape, weight.shape)
+        torch.testing.assert_close(restored, weight, rtol=0.07, atol=0.01)
+
+    def test_dequantize_packed_fp4_uses_scale_grid(self):
+        packed = torch.full((2, 32), 0x21, dtype=torch.int8)
+        scales = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+        actual = Fp8Dequantize(self.hf_quantizer)._dequantize_one(
+            packed,
+            scales,
+            output_dtype=torch.float32,
+        )
+
+        unpacked = torch.tensor([0.5, 1.0], dtype=torch.float32).repeat(2, 32)
+        expected = unpacked * scales.repeat_interleave(32, dim=1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_dequantize_mxfp8_uses_scale_grid(self):
+        weight = torch.ones((2, 64), dtype=torch.float8_e4m3fn)
+        scales = torch.tensor([[127, 128], [129, 130]], dtype=torch.uint8)
+
+        actual = Fp8Dequantize(self.hf_quantizer)._dequantize_one(
+            weight,
+            scales,
+            output_dtype=torch.bfloat16,
+        )
+
+        expected_scales = torch.tensor([[1.0, 2.0], [4.0, 8.0]]).repeat_interleave(32, dim=1)
+        torch.testing.assert_close(actual, expected_scales.to(torch.bfloat16), rtol=0, atol=0)
+
+    def test_dequantize_rejects_invalid_fp8_scale_grid(self):
+        weight = torch.ones((129, 130), dtype=torch.float8_e4m3fn)
+        scales = torch.ones((4, 2), dtype=torch.float32)
+
+        with self.assertRaisesRegex(ValueError, "expects scale grid"):
+            Fp8Dequantize(self.hf_quantizer)._dequantize_one(weight, scales)
 
 
 @require_torch_accelerator
@@ -462,7 +537,7 @@ class FP8LinearTest(unittest.TestCase):
 
 
 class FP8DeepGEMMMultiDeviceTest(unittest.TestCase):
-    """`disable_deepgemm_on_multi_device` must flag FP8 modules based on the devices they actually
+    """`_disable_deepgemm_on_multi_device` must flag FP8 modules based on the devices they actually
     occupy — DeepGEMM's kernels are bound to a single CUDA context and corrupt across devices, but a
     model that fits on one device must keep DeepGEMM even when other GPUs are visible (no overshoot).
     """
@@ -475,22 +550,22 @@ class FP8DeepGEMMMultiDeviceTest(unittest.TestCase):
 
     @require_torch_multi_gpu
     def test_multi_device_disables_deepgemm(self):
-        from transformers.integrations.finegrained_fp8 import disable_deepgemm_on_multi_device
+        from transformers.integrations.finegrained_fp8 import _disable_deepgemm_on_multi_device
 
         model = torch.nn.Module()
         model.a = self._fp8_module("cuda:0")
         model.b = self._fp8_module("cuda:1")
-        disable_deepgemm_on_multi_device(model)
+        _disable_deepgemm_on_multi_device(model)
         self.assertTrue(model.a._deepgemm_disabled)
         self.assertTrue(model.b._deepgemm_disabled)
 
     @require_torch_gpu
     def test_single_device_keeps_deepgemm(self):
-        from transformers.integrations.finegrained_fp8 import disable_deepgemm_on_multi_device
+        from transformers.integrations.finegrained_fp8 import _disable_deepgemm_on_multi_device
 
         model = torch.nn.Module()
         model.a = self._fp8_module("cuda:0")
         model.b = self._fp8_module("cuda:0")
-        disable_deepgemm_on_multi_device(model)
+        _disable_deepgemm_on_multi_device(model)
         self.assertFalse(model.a._deepgemm_disabled)
         self.assertFalse(model.b._deepgemm_disabled)
